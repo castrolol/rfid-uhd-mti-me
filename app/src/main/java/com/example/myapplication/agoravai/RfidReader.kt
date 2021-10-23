@@ -5,22 +5,26 @@ import android.content.Context
 import android.content.Intent
 import android.hardware.usb.UsbDevice
 import android.hardware.usb.UsbManager
-import android.os.Handler
+import android.media.AudioManager
+import android.media.ToneGenerator
 import android.util.Log
-import android.widget.Toast
 import com.example.myapplication.*
-import com.example.myapplication.MainActivity
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import java.util.*
 
 class RfidReader(val context: Context, val usbManager: UsbManager) {
     companion object {
-        val DEBUG = false
+        val TAG = RfidReader.javaClass.name
+        val DEBUG = true
         val ACTION_USB_PERMISSION = "com.mti.rfid.minime.USB_PERMISSION"
         val PID = 49193
         val VID = 4901
     }
+
+    protected val scope = CoroutineScope(Dispatchers.IO)
 
     var connectionChangeListener: (Boolean) -> Unit = { _ -> }
     val usbCommunication = UsbCommunication.newInstance()
@@ -33,20 +37,54 @@ class RfidReader(val context: Context, val usbManager: UsbManager) {
     val permissionIntent =
         PendingIntent.getBroadcast(context, 0, Intent(ACTION_USB_PERMISSION), 0)
 
+   fun readTag(tries: Int = 10) = scope.run {
+
+        val tags = mutableListOf<String>()
+        var numTags: Byte = 0
+        val tg = ToneGenerator(AudioManager.STREAM_MUSIC, 100)
+        var hasError = false;
+        for (i in 0..tries) {
+
+            val command = CommandIso18k6cTagAccess.RFID18K6CTagInventory(usbCommunication)
+            if (command.setCmd(CommandIso18k6cTagAccess.Action.StartInventory)) {
+                if (command.tagNumber > 0) {
+                    tg.startTone(ToneGenerator.TONE_PROP_BEEP)
+                    tags.add(command.tagId)
+                }
+                numTags = command.tagNumber
+                while (numTags > 1) {
+                    if (command.setCmd(CommandIso18k6cTagAccess.Action.NextTag)) {
+                        tags.add(command.tagId)
+                    }
+                    numTags--
+                }
+                if (tags.isNotEmpty()) break;
+            } else {
+
+                // #### process error ####
+                hasError = true;
+                Log.d(TAG, "Process on Command reading tag")
+            }
+        }
+
+        if (tags.isEmpty() && hasError) tg.startTone(ToneGenerator.TONE_PROP_NACK)
+
+        return@run runCatching {
+            return@runCatching tags.map { convertEPC(it) }
+        }.getOrElse { listOf() }
+
+    }
+
 
     private fun setPowerLevel() {
-
-        val mMtiCmd: MtiCmd = CMD_AntPortOp.RFID_AntennaPortSetPowerLevel(usbCommunication)
-        val finalCmd: CMD_AntPortOp.RFID_AntennaPortSetPowerLevel =
-            mMtiCmd as CMD_AntPortOp.RFID_AntennaPortSetPowerLevel
-        finalCmd.setCmd(18.toByte())
+        CommandAntenaPortOperation
+            .RFIDAntennaPortSetPowerLevel(usbCommunication)
+            .setCmd(18.toByte())
     }
 
     private fun setPowerState() {
-//        val mMtiCmd: MtiCmd = CMD_PwrMgt.RFID_PowerEnterPowerState(mUsbCommunication)
-//        val finalCmd: CMD_PwrMgt.RFID_PowerEnterPowerState =
-//            mMtiCmd as CMD_PwrMgt.RFID_PowerEnterPowerState
-//
+        val cmd = CommandPowerManagement.RFIDPowerEnterPowerState(usbCommunication)
+        cmd.setCmd(CommandPowerManagement.PowerState.Ready)
     }
 
     fun onConnectionChange(listener: (Boolean) -> Unit) {
@@ -54,18 +92,37 @@ class RfidReader(val context: Context, val usbManager: UsbManager) {
     }
 
     fun handleResume() {
+        Log.d("RfidReader", "handleResume():")
+
         val deviceList = usbManager.deviceList
         val deviceIterator: Iterator<UsbDevice> = deviceList.values.iterator()
+        Log.d("RfidReader", "deviceList: ${deviceList.size} devices")
+        if (deviceList.size <= 0) {
+            notifyConnected()
+            return;
+        }
         while (deviceIterator.hasNext()) {
             val device = deviceIterator.next()
-            if (device.productId == MainActivity.PID && device.vendorId == MainActivity.VID) {
+            Log.d(
+                "RfidReader",
+                "reading device product=${device.productId} vendor=${device.vendorId}"
+            )
+            if (device.productId == PID && device.vendorId == VID) {
                 if (!usbManager.hasPermission(device)) {
+                    Log.d(
+                        "RfidReader",
+                        "without permission"
+                    )
                     usbManager.requestPermission(
                         device,
                         permissionIntent
                     )
                 } else {
-                    usbCommunication.setUsbInterface(usbManager, device)
+                    Log.d(
+                        "RfidReader",
+                        "with permission"
+                    )
+                    usbCommunication?.setUsbInterface(usbManager, device)
                     isConnected = true
                 }
                 break
@@ -73,60 +130,56 @@ class RfidReader(val context: Context, val usbManager: UsbManager) {
         }
     }
 
+    private fun notifyConnected() {
+        connectionChangeListener?.invoke(isConnected)
+    }
+
     fun handleReceive(context: Context, intent: Intent): Boolean {
         val action = intent.action
         var result = true
 
-        if (MainActivity.DEBUG) Toast.makeText(
-            context,
-            "Broadcast Receiver",
-            Toast.LENGTH_SHORT
-        ).show()
-        if (UsbManager.ACTION_USB_DEVICE_ATTACHED == action) {                    // will intercept by system
-            if (MainActivity.DEBUG) Toast.makeText(context, "USB Attached", Toast.LENGTH_SHORT)
-                .show()
-            val device = intent.getParcelableExtra<UsbDevice>(UsbManager.EXTRA_DEVICE)
-            usbCommunication.setUsbInterface(usbManager, device)
-            isConnected = true
-        } else if (UsbManager.ACTION_USB_DEVICE_DETACHED == action) {
-            if (MainActivity.DEBUG) Toast.makeText(context, "USB Detached", Toast.LENGTH_SHORT)
-                .show()
-            usbCommunication.setUsbInterface(null, null)
-            isConnected = false
-            //				getReaderSn(false);
-        } else if (MainActivity.ACTION_USB_PERMISSION == action) {
-            if (MainActivity.DEBUG) Toast.makeText(
-                context,
-                "USB Permission",
-                Toast.LENGTH_SHORT
-            ).show()
-            Log.d(UsbCommunication.TAG, "permission")
 
+        when {
+            UsbManager.ACTION_USB_DEVICE_ATTACHED == action -> {                    // will intercept by system
+                val device = intent.getParcelableExtra<UsbDevice>(UsbManager.EXTRA_DEVICE)
+                usbCommunication?.setUsbInterface(usbManager, device)
+                isConnected = true
+            }
+            UsbManager.ACTION_USB_DEVICE_DETACHED == action -> {
 
-            runBlocking {
-                launch(Dispatchers.Main) {
+                usbCommunication?.setUsbInterface(null, null)
+                isConnected = false
+                //				getReaderSn(false);
+            }
+            ACTION_USB_PERMISSION == action -> {
+
+                Log.d(UsbCommunication.TAG, "permission")
+
+                scope.launch(Dispatchers.Main) {
                     val device =
                         intent.getParcelableExtra<UsbDevice>(UsbManager.EXTRA_DEVICE)
                     if (intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false)) {
-                        usbCommunication.setUsbInterface(usbManager, device)
+                        usbCommunication?.setUsbInterface(usbManager, device)
                         isConnected = true
 
                         setPowerLevel()
                         setPowerState()
                     } else {
-                        result = false
+                        runCatching {
+                            result = false
+                        }
+
                     }
-
                 }
-            }
 
+            }
         }
         return result
     }
 
     fun handlePause() {
         if (isConnected) {
-            usbCommunication.setUsbInterface(null, null)
+            usbCommunication?.setUsbInterface(null, null)
             isConnected = false
         }
     }
